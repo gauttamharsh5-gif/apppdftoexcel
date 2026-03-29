@@ -40,6 +40,7 @@ def call_llm(prompt, require_json=True):
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"]
     except Exception as e:
+        st.warning(f"LLM API Error: {e}")
         return "{}"
 
 # ==============================
@@ -83,12 +84,13 @@ def clean_dataframe(df):
 # 1. DYNAMIC CONSULTANT
 # ==============================
 def consult_structure(sample_text):
+    """Analyzes the first few pages to determine columns and extraction method."""
     prompt = f"""
     Analyze this bank statement text.
-    1. What are the EXACT column headers for the transaction table?
+    1. What are the EXACT column headers for the transaction table? (e.g., Date, Description, Withdrawals, Deposits, Balance)
     2. Does the text look like a structured grid (choose 'table') or a messy block of text (choose 'llm')?
     
-    TEXT: {sample_text[:3000]}
+    TEXT: {sample_text[:4000]}
     
     Return ONLY JSON:
     {{
@@ -99,6 +101,7 @@ def consult_structure(sample_text):
     res = safe_json_loads(call_llm(prompt))
     if res and "columns" in res and len(res["columns"]) > 0:
         return res["method"], res["columns"]
+    # Ultimate fallback
     return "llm", ["Date", "Description", "Withdrawal", "Deposit", "Balance"]
 
 # ==============================
@@ -115,10 +118,18 @@ def extract_via_table(pdf_bytes, columns, password=None):
                     clean_row = [str(c).strip().replace('\n', ' ') if c else "" for c in row]
                     if not any(clean_row): continue
                     
+                    # Pad or truncate to match exact column count
                     while len(clean_row) < target_len: clean_row.append("")
                     rows.append(clean_row[:target_len])
 
     df = pd.DataFrame(rows, columns=columns)
+    
+    # Remove header row if it was scraped as data
+    if not df.empty:
+        first_row_str = " ".join(df.iloc[0].astype(str)).lower()
+        if any(kw in first_row_str for kw in ["date", "description", "balance"]):
+            df = df.iloc[1:].reset_index(drop=True)
+            
     return clean_dataframe(df)
 
 # ==============================
@@ -149,7 +160,7 @@ def extract_via_llm(pages_text, columns):
         if data and "transactions" in data and isinstance(data["transactions"], list):
             all_data.extend(data["transactions"])
             
-        time.sleep(1)
+        time.sleep(1) # Protect free API tier
         
     df = pd.DataFrame(all_data)
     return clean_dataframe(df)
@@ -167,7 +178,7 @@ def validate_data(df, raw_text):
     You are a tax auditor. I have extracted transaction data from a bank statement, ignoring all redundant info (like page numbers and opening balances).
     
     RAW TEXT (May contain noise): 
-    {raw_text[:2000]}
+    {raw_text[:3000]}
     
     EXTRACTED CLEAN TRANSACTIONS (JSON): 
     {sample_json}
@@ -181,10 +192,10 @@ def validate_data(df, raw_text):
     return True, "Validation parsing failed, assuming okay."
 
 # ==============================
-# UI
+# UI & EXECUTION LOGIC
 # ==============================
 st.title("🧾 Tax-Ready PDF Parser")
-st.markdown("Extracts dynamic columns and aggressively removes non-transactional noise.")
+st.markdown("Extracts dynamic columns, skips cover pages, and aggressively removes non-transactional noise.")
 
 file = st.file_uploader("Upload Bank Statement (PDF)", type=["pdf"])
 
@@ -199,28 +210,35 @@ if file:
                 with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
                     for page in pdf.pages:
                         t = page.extract_text()
-                        if t: pages_text.append(t)
+                        # Only append if the page actually contains a meaningful amount of text
+                        if t and len(t.strip()) > 20: 
+                            pages_text.append(t)
             except Exception as e:
                 st.error(f"Could not read PDF: {e}")
                 st.stop()
                 
             if not pages_text:
-                st.error("❌ No text found. Scanned image requiring OCR.")
+                st.error("❌ No digital text found anywhere in the document. This is likely a scanned image requiring OCR.")
                 st.stop()
                 
-            first_page_raw = pages_text[0]
+            # Combine up to the first 3 valid pages to ensure we hit the transaction table
+            sample_text = "\n".join(pages_text[:min(3, len(pages_text))])
 
-        with st.spinner("🧠 Defining dynamic columns..."):
-            method, columns = consult_structure(first_page_raw)
+        # STEP 1: Consult
+        with st.spinner("🧠 Defining dynamic columns from the first few pages..."):
+            method, columns = consult_structure(sample_text)
             st.success(f"**Detected Columns:** `{', '.join(columns)}`")
 
         final_df = pd.DataFrame()
+        
+        # Load strategies, placing the LLM's recommended one first
         strategies = [
             ("table", lambda: extract_via_table(pdf_bytes, columns, password)),
             ("llm", lambda: extract_via_llm(pages_text, columns))
         ]
         if method == "llm": strategies.reverse()
 
+        # STEP 2: Execute
         st.write("### ⚙️ Extraction & Cleaning Process")
         for strategy_name, strategy_func in strategies:
             status = st.empty()
@@ -236,19 +254,21 @@ if file:
                 final_df = df
                 break
             else:
-                status.error(f"❌ **{strategy_name.upper()}** failed. Falling back...")
+                status.error(f"❌ **{strategy_name.upper()}** failed or yielded 0 rows. Falling back...")
 
         if final_df.empty:
-            st.error("🚨 All extraction methods failed.")
+            st.error("🚨 All extraction methods failed. The document layout may be unsupported.")
             st.stop()
 
+        # STEP 3: Validate
         with st.spinner("🕵️ Validating clean data for tax compliance..."):
-            is_valid, reason = validate_data(final_df, first_page_raw)
+            is_valid, reason = validate_data(final_df, sample_text)
             if is_valid:
                 st.success(f"🏆 **Audit Passed:** {reason}")
             else:
                 st.warning(f"⚠️ **Audit Warning:** {reason}")
 
+        # Final Output
         st.dataframe(final_df.head(15))
         
         buf = io.BytesIO()
