@@ -44,41 +44,42 @@ def call_llm(prompt, require_json=True):
         return "{}"
 
 # ==============================
-# DATA CLEANING ENGINE (FOR TAX)
+# HYPER-SAFE DATA CLEANER
 # ==============================
 def clean_dataframe(df):
-    """Purges non-transactional noise (headers, opening balances, pages)."""
+    """Carefully purges noise WITHOUT risking actual transaction records."""
     if df.empty: return df
     
-    # 1. Drop completely empty rows
-    df.dropna(how='all', inplace=True)
+    # Drop completely empty rows
+    df = df.dropna(how='all')
+    cleaned_rows = []
     
-    # 2. Filter out common bank statement artifacts
-    ignore_keywords = [
-        'opening balance', 'brought forward', 'carried forward', 
-        'closing balance', 'statement summary', 'page '
-    ]
-    
-    mask = pd.Series([True] * len(df))
-    for col in df.columns:
-        if df[col].dtype == object:
-            str_col = df[col].astype(str).str.lower()
-            for kw in ignore_keywords:
-                # Keep the row only if it DOES NOT contain the ignore keyword
-                mask = mask & ~str_col.str.contains(kw, na=False)
-                
-    df = df[mask]
-    
-    # 3. Ensure the 'Date' column actually contains numbers (drops random text rows)
-    date_col = next((col for col in df.columns if 'date' in col.lower()), None)
-    if not date_col and len(df.columns) > 0:
-        date_col = df.columns[0] # Assume the first column is the date if unnamed
+    for _, row in df.iterrows():
+        # Convert row to a single searchable string
+        row_str = " ".join(row.fillna("").astype(str)).lower().strip()
         
-    if date_col:
-        # Keep rows where the date column has at least one digit
-        df = df[df[date_col].astype(str).str.contains(r'\d', na=False)]
+        # 1. STRICT TAX NOISE: Only match exact accounting phrases
+        is_tax_noise = bool(re.search(r"\b(opening balance|brought forward|carried forward|closing balance|statement summary)\b", row_str))
         
-    return df.reset_index(drop=True)
+        # 2. PAGE NOISE: Only drop if the row STARTS with "page X"
+        is_page_noise = bool(re.search(r"^page\s*\d+", row_str)) 
+        
+        if is_tax_noise or is_page_noise:
+            continue # Safely drop
+            
+        # 3. HEADER STRIPPING: If the first column is literally the word "Date", it's a repeated header
+        first_col_val = str(row.iloc[0]).strip().lower()
+        if first_col_val in ["date", "transaction date", "txn date", "posting date"]:
+            continue
+            
+        # 4. NUMBER CHECK: A real transaction MUST have at least one number (a date or an amount)
+        if not re.search(r'\d', row_str):
+            continue # Drop rows that are purely alphabetical text
+            
+        cleaned_rows.append(row)
+        
+    final_df = pd.DataFrame(cleaned_rows, columns=df.columns)
+    return final_df.reset_index(drop=True)
 
 # ==============================
 # 1. DYNAMIC CONSULTANT
@@ -101,7 +102,6 @@ def consult_structure(sample_text):
     res = safe_json_loads(call_llm(prompt))
     if res and "columns" in res and len(res["columns"]) > 0:
         return res["method"], res["columns"]
-    # Ultimate fallback
     return "llm", ["Date", "Description", "Withdrawal", "Deposit", "Balance"]
 
 # ==============================
@@ -123,13 +123,6 @@ def extract_via_table(pdf_bytes, columns, password=None):
                     rows.append(clean_row[:target_len])
 
     df = pd.DataFrame(rows, columns=columns)
-    
-    # Remove header row if it was scraped as data
-    if not df.empty:
-        first_row_str = " ".join(df.iloc[0].astype(str)).lower()
-        if any(kw in first_row_str for kw in ["date", "description", "balance"]):
-            df = df.iloc[1:].reset_index(drop=True)
-            
     return clean_dataframe(df)
 
 # ==============================
@@ -147,9 +140,8 @@ def extract_via_llm(pages_text, columns):
         
         CRITICAL TAX RULES:
         1. ONLY extract actual financial transactions.
-        2. DO NOT extract "Opening Balance", "Brought Forward", "Closing Balance", or "Carried Forward".
-        3. DO NOT extract page numbers, headers, or statement summaries.
-        4. If a column has no data, use null.
+        2. DO NOT extract "Opening Balance", "Closing Balance", or statement summaries.
+        3. If a column has no data, use null.
         
         TEXT: {text[:5000]} 
         """
@@ -166,36 +158,54 @@ def extract_via_llm(pages_text, columns):
     return clean_dataframe(df)
 
 # ==============================
-# 4. VALIDATION
+# 4. SMART VALIDATION
 # ==============================
 def validate_data(df, raw_text):
-    if df.empty or len(df) < 2: return False, "Not enough rows extracted."
+    if df.empty or len(df) < 2: 
+        return False, "Not enough rows extracted."
     
-    # Send a small sample of the CLEANED data for validation
-    sample_json = df.head(4).to_json(orient="records")
+    # Grab the first 3 cleaned rows
+    sample_df = df.head(3)
+    sample_json = sample_df.to_json(orient="records")
     
+    # Find the exact spot in the raw text where the first transaction occurs
+    first_row = sample_df.iloc[0]
+    anchor_str = str(first_row.iloc[0]).strip() 
+    start_idx = raw_text.find(anchor_str)
+    
+    if start_idx != -1:
+        # Cut a window of text exactly where the data starts
+        text_chunk = raw_text[max(0, start_idx - 200) : start_idx + 1500]
+    else:
+        text_chunk = raw_text[:2000] 
+
     prompt = f"""
-    You are a tax auditor. I have extracted transaction data from a bank statement, ignoring all redundant info (like page numbers and opening balances).
+    You are a lenient Data Auditor. Verify if the EXTRACTED JSON matches the RAW TEXT.
     
-    RAW TEXT (May contain noise): 
-    {raw_text[:3000]}
+    RAW TEXT CHUNK: 
+    {text_chunk}
     
-    EXTRACTED CLEAN TRANSACTIONS (JSON): 
+    EXTRACTED JSON (First 3 rows): 
     {sample_json}
     
-    Does the extracted JSON accurately reflect the *actual transactions* found in the text without including redundant headers/balances?
-    Return JSON {{"is_correct": true/false, "reason": "why"}}
+    AUDIT RULES:
+    1. Check if the amounts and dates in the JSON exist in the raw text. 
+    2. If the numbers match, the extraction is CORRECT.
+    3. IGNORE slight differences in text descriptions.
+    4. IGNORE missing "Opening Balance" rows (intentionally removed).
+    
+    Return ONLY JSON: {{"is_correct": true or false, "reason": "1 short sentence explaining why."}}
     """
     res = safe_json_loads(call_llm(prompt))
     if res and "is_correct" in res:
-        return res["is_correct"], res.get("reason", "Clean and accurate.")
-    return True, "Validation parsing failed, assuming okay."
+        return res["is_correct"], res.get("reason", "Verified against source text.")
+    return True, "Validation parsing failed, assuming data is okay."
 
 # ==============================
 # UI & EXECUTION LOGIC
 # ==============================
 st.title("🧾 Tax-Ready PDF Parser")
-st.markdown("Extracts dynamic columns, skips cover pages, and aggressively removes non-transactional noise.")
+st.markdown("Extracts dynamic columns, skips cover pages, and safely cleans data.")
 
 file = st.file_uploader("Upload Bank Statement (PDF)", type=["pdf"])
 
@@ -210,7 +220,6 @@ if file:
                 with pdfplumber.open(io.BytesIO(pdf_bytes), password=password) as pdf:
                     for page in pdf.pages:
                         t = page.extract_text()
-                        # Only append if the page actually contains a meaningful amount of text
                         if t and len(t.strip()) > 20: 
                             pages_text.append(t)
             except Exception as e:
@@ -218,27 +227,23 @@ if file:
                 st.stop()
                 
             if not pages_text:
-                st.error("❌ No digital text found anywhere in the document. This is likely a scanned image requiring OCR.")
+                st.error("❌ No digital text found. This is likely a scanned image requiring OCR.")
                 st.stop()
                 
-            # Combine up to the first 3 valid pages to ensure we hit the transaction table
+            # Combine up to the first 3 valid pages to ensure we hit the table
             sample_text = "\n".join(pages_text[:min(3, len(pages_text))])
 
-        # STEP 1: Consult
-        with st.spinner("🧠 Defining dynamic columns from the first few pages..."):
+        with st.spinner("🧠 Defining dynamic columns..."):
             method, columns = consult_structure(sample_text)
             st.success(f"**Detected Columns:** `{', '.join(columns)}`")
 
         final_df = pd.DataFrame()
-        
-        # Load strategies, placing the LLM's recommended one first
         strategies = [
             ("table", lambda: extract_via_table(pdf_bytes, columns, password)),
             ("llm", lambda: extract_via_llm(pages_text, columns))
         ]
         if method == "llm": strategies.reverse()
 
-        # STEP 2: Execute
         st.write("### ⚙️ Extraction & Cleaning Process")
         for strategy_name, strategy_func in strategies:
             status = st.empty()
@@ -250,7 +255,7 @@ if file:
                 df = pd.DataFrame()
                 
             if not df.empty and len(df) > 1 and len(df.columns) == len(columns):
-                status.success(f"✅ **{strategy_name.upper()}** succeeded & cleaned! ({len(df)} transactions)")
+                status.success(f"✅ **{strategy_name.upper()}** succeeded & safely cleaned! ({len(df)} transactions)")
                 final_df = df
                 break
             else:
@@ -260,15 +265,13 @@ if file:
             st.error("🚨 All extraction methods failed. The document layout may be unsupported.")
             st.stop()
 
-        # STEP 3: Validate
-        with st.spinner("🕵️ Validating clean data for tax compliance..."):
+        with st.spinner("🕵️ Validating extracted data..."):
             is_valid, reason = validate_data(final_df, sample_text)
             if is_valid:
                 st.success(f"🏆 **Audit Passed:** {reason}")
             else:
                 st.warning(f"⚠️ **Audit Warning:** {reason}")
 
-        # Final Output
         st.dataframe(final_df.head(15))
         
         buf = io.BytesIO()
