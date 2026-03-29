@@ -9,7 +9,7 @@ import requests
 # ==============================
 # CONFIG
 # ==============================
-st.set_page_config(page_title="PDF → Excel", layout="centered")
+st.set_page_config(page_title="Smart PDF → Excel", layout="centered")
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 
@@ -29,9 +29,6 @@ def clean_amount(val):
     except:
         return None
 
-# ==============================
-# PASSWORD HANDLING
-# ==============================
 def open_pdf_with_password(pdf_bytes, password=None):
     try:
         return pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
@@ -43,10 +40,10 @@ def open_pdf_with_password(pdf_bytes, password=None):
 # ==============================
 def extract_via_table(pdf_bytes, password=None):
     rows = []
-
     pdf = open_pdf_with_password(pdf_bytes, password)
+
     if pdf is None:
-        raise ValueError("Incorrect password or unreadable PDF")
+        return pd.DataFrame()
 
     with pdf:
         for page in pdf.pages:
@@ -70,27 +67,80 @@ def extract_via_table(pdf_bytes, password=None):
     return pd.DataFrame(rows)
 
 # ==============================
-# LLM EXTRACTION (FIXED)
+# SAMPLE TEXT
+# ==============================
+def extract_sample_text(pdf_bytes, password=None, pages=2):
+    texts = []
+    pdf = open_pdf_with_password(pdf_bytes, password)
+
+    if pdf is None:
+        return ""
+
+    with pdf:
+        for i in range(min(pages, len(pdf.pages))):
+            t = pdf.pages[i].extract_text()
+            if t:
+                texts.append(t)
+
+    return "\n".join(texts)
+
+# ==============================
+# LLM: STRUCTURE DETECTION
+# ==============================
+def detect_structure_with_llm(sample_text, sample_table):
+    prompt = f"""
+You are a data engineer.
+
+Analyze this document.
+
+TEXT:
+{sample_text[:2000]}
+
+TABLE SAMPLE:
+{str(sample_table[:5])}
+
+Return ONLY JSON:
+
+{{
+  "is_standard": true/false,
+  "recommended_method": "table" or "llm",
+  "reason": "short reason"
+}}
+"""
+
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": "llama-3.1-8b-instant",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0
+        }
+    )
+
+    content = response.json()["choices"][0]["message"]["content"]
+
+    try:
+        return json.loads(content)
+    except:
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        return json.loads(content[start:end])
+
+# ==============================
+# LLM: DATA EXTRACTION
 # ==============================
 def extract_structured_via_llm(text):
     prompt = f"""
-You are a financial data extraction system.
-
-Extract ALL transactions into JSON.
+Extract data into JSON.
 
 Columns:
-- Date (DD-MM-YYYY)
-- Particulars
-- Cheque_No
-- Withdrawals
-- Deposits
-- Balance
+Date, Particulars, Cheque_No, Withdrawals, Deposits, Balance
 
-STRICT RULES:
-- Return ONLY JSON array
-- No explanation
-- No markdown
-- Use null for missing values
+Return ONLY JSON array.
 
 TEXT:
 {text[:4000]}
@@ -111,51 +161,26 @@ TEXT:
 
     content = response.json()["choices"][0]["message"]["content"]
 
-    # =========================
-    # ROBUST JSON PARSING
-    # =========================
-
-    # 1️⃣ Direct JSON
+    # Robust JSON parsing
     try:
         return pd.DataFrame(json.loads(content))
     except:
         pass
 
-    # 2️⃣ Extract JSON array
     try:
         start = content.find("[")
         end = content.rfind("]") + 1
-        json_str = content[start:end]
-        return pd.DataFrame(json.loads(json_str))
+        return pd.DataFrame(json.loads(content[start:end]))
     except:
         pass
 
-    # 3️⃣ Remove markdown
     try:
         cleaned = re.sub(r"```json|```", "", content).strip()
         return pd.DataFrame(json.loads(cleaned))
     except:
-        pass
-
-    # ❌ Fail → show debug
-    st.error("❌ JSON parsing failed")
-    st.code(content)
-    raise ValueError("Invalid LLM JSON")
-
-def extract_sample_text(pdf_bytes, password=None, pages=2):
-    texts = []
-    pdf = open_pdf_with_password(pdf_bytes, password)
-
-    if pdf is None:
-        return ""
-
-    with pdf:
-        for i in range(min(pages, len(pdf.pages))):
-            t = pdf.pages[i].extract_text()
-            if t:
-                texts.append(t)
-
-    return "\n".join(texts)
+        st.error("❌ JSON parsing failed")
+        st.code(content)
+        return pd.DataFrame()
 
 # ==============================
 # VALIDATION
@@ -168,19 +193,20 @@ def validate_first_page(df):
 
     bad_dates = df[~df["Date"].astype(str).str.match(r"\d{2}-\d{2}-\d{4}", na=False)]
     if not bad_dates.empty:
-        issues.append(f"{len(bad_dates)} invalid dates")
+        issues.append("Invalid dates found")
 
     both = df[df["Withdrawals"].notna() & df["Deposits"].notna()]
     if not both.empty:
-        issues.append(f"{len(both)} rows with both debit & credit")
+        issues.append("Debit & Credit both filled")
 
-    if df["Balance"].isna().mean() > 0.5:
-        issues.append("Too many missing balances")
+    if "Balance" in df.columns:
+        if df["Balance"].isna().mean() > 0.5:
+            issues.append("Too many missing balances")
 
     return issues
 
 # ==============================
-# TO EXCEL
+# EXCEL
 # ==============================
 def df_to_excel(df):
     buf = io.BytesIO()
@@ -192,71 +218,56 @@ def df_to_excel(df):
 # ==============================
 # UI
 # ==============================
-st.title("🏦 Bank PDF → Excel")
+st.title("🧠 Smart PDF → Excel")
 
 pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
 
 if pdf_file:
 
     pdf_bytes = pdf_file.read()
-
-    password = st.text_input("🔐 Enter Password (if protected)", type="password")
+    password = st.text_input("🔐 Password (if needed)", type="password")
 
     if st.button("🚀 Convert"):
 
-        df = pd.DataFrame()
+        # STEP 1: Extract both
+        table_df = extract_via_table(pdf_bytes, password=password or None)
+        sample_text = extract_sample_text(pdf_bytes, password=password or None)
 
-        # STEP 1: TABLE EXTRACTION
-        try:
-            with st.spinner("🔍 Reading tables..."):
-                df = extract_via_table(pdf_bytes, password=password or None)
+        # STEP 2: LLM decision
+        with st.spinner("🧠 Understanding structure..."):
+            decision = detect_structure_with_llm(
+                sample_text,
+                table_df.to_dict("records")
+            )
 
-            if not df.empty:
-                st.success(f"✅ Table extraction worked ({len(df)} rows)")
-            else:
-                st.warning("⚠️ No table data found")
+        st.json(decision)
 
-        except Exception:
-            st.warning("⚠️ PDF locked or table extraction failed")
+        # STEP 3: Route
+        if decision["recommended_method"] == "table" and not table_df.empty:
 
-        # STEP 2: VALIDATION
-        if not df.empty:
-            issues = validate_first_page(df.head(20))
+            st.success("✅ Using table extraction")
+            df = table_df
+
+            issues = validate_first_page(df.head(50))
 
             if issues:
-                st.warning("⚠️ Validation issues:")
-                for i in issues:
-                    st.write(f"- {i}")
-                df = pd.DataFrame()
-            else:
-                st.success("✅ First page validated!")
+                st.warning("⚠️ Validation failed → switching to LLM")
+                df = extract_structured_via_llm(sample_text)
 
-        # STEP 3: LLM FALLBACK
-        if df.empty:
+        else:
+            st.warning("🤖 Using LLM extraction")
+            df = extract_structured_via_llm(sample_text)
 
-            if not GROQ_API_KEY:
-                st.error("❌ Missing Groq API key")
-                st.stop()
-
-            with st.spinner("🤖 AI extracting..."):
-                text = extract_sample_text(pdf_bytes, password=password or None)
-
-                if not text:
-                    st.error("❌ Could not read PDF (check password)")
-                    st.stop()
-
-                df = extract_structured_via_llm(text)
-
-        # FINAL OUTPUT
+        # STEP 4: Output
         if df.empty:
             st.error("❌ No data extracted")
         else:
-            st.success("✅ Done!")
+            st.success("✅ Done")
 
             st.dataframe(df.head(10), use_container_width=True)
 
-            total_dr = pd.to_numeric(df["Withdrawals"], errors="coerce").sum()
-            total_cr = pd.to_numeric(df["Deposits"], errors="coerce").sum()
+            total_dr = pd.to_numeric(df.get("Withdrawals"), errors="coerce").sum()
+            total_cr = pd.to_numeric(df.get("Deposits"), errors="coerce").sum()
 
             st.write(f"💸 Withdrawals: ₹{total_dr:,.2f}")
             st.write(f"💰 Deposits: ₹{total_cr:,.2f}")
@@ -266,9 +277,9 @@ if pdf_file:
             st.download_button(
                 "⬇️ Download Excel",
                 data=excel,
-                file_name="transactions.xlsx",
+                file_name="output.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
 else:
-    st.info("Upload a PDF to begin.")
+    st.info("Upload a PDF to start.")
