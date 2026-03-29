@@ -49,11 +49,7 @@ def extract_pages_text(pdf_bytes, password=None):
             if t: pages_text.append(t)
     return pages_text
 
-# ==============================
-# LLM CALLER
-# ==============================
 def call_llm(prompt):
-    """Generic function to call Groq API requiring JSON output."""
     try:
         res = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -72,24 +68,34 @@ def call_llm(prompt):
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        st.warning(f"LLM API Error: {e}")
         return "{}"
 
 # ==============================
-# STEP 1: CONSULT THE LLM
+# STEP 1: CONSULT THE LLM (NOW WITH FEEDBACK)
 # ==============================
-def consult_llm_for_strategy(first_page_text):
-    """Ask the LLM to figure out the Regex patterns based on the text."""
+def consult_llm_for_strategy(first_page_text, feedback=""):
     prompt = f"""
     Analyze this bank statement text and determine the Python Regular Expression needed to extract the data line-by-line.
     
     RAW TEXT:
     {first_page_text[:3000]}
+    """
     
+    # If a previous attempt failed, inject the feedback here to force correction
+    if feedback:
+        prompt += f"""
+        
+    ⚠️ PREVIOUS ATTEMPT FAILED:
+    {feedback}
+    You MUST look closely at the RAW TEXT above and provide DIFFERENT, more accurate regex patterns. 
+    Ensure you account for the exact spacing and date formats present in the text.
+    """
+
+    prompt += """
     Return ONLY a JSON object with these exact keys:
-    1. "date_regex": A Python regex string to match the date at the start of a transaction line. (Use double backslashes, e.g., "^(\\\\d{{2}}[-/\\\\s]\\\\d{{2}}[-/\\\\s]\\\\d{{2,4}})").
-    2. "amount_regex": A Python regex string to extract currency amounts like 1,234.56 or 500.00 Cr. (e.g., "([\\\\d,]+\\\\.\\\\d{{2}}\\\\s*(?:Cr|Dr)?)").
-    3. "confidence": A number from 1 to 10 on how confident you are in these rules.
+    1. "date_regex": A Python regex string to match the date at the start of a transaction line. (Use double backslashes, e.g., "^(\\\\d{2}[-/\\\\s]\\\\d{2}[-/\\\\s]\\\\d{2,4})").
+    2. "amount_regex": A Python regex string to extract currency amounts.
+    3. "confidence": A number from 1 to 10.
     """
     
     response = call_llm(prompt)
@@ -100,52 +106,39 @@ def consult_llm_for_strategy(first_page_text):
     return None
 
 # ==============================
-# STEP 2: EXECUTE (PYTHON)
+# STEP 2: EXECUTE
 # ==============================
 def execute_extraction(pages_text, strategy):
-    """Use the LLM's strategy to parse the whole document. Includes a safety fallback."""
     transactions = []
     
-    # Try compiling LLM's regex, fallback to defaults if it hallucinates bad regex
     try:
         date_pattern = re.compile(strategy["date_regex"])
         amount_pattern = re.compile(strategy["amount_regex"], re.IGNORECASE)
-        st.info("🧠 Using LLM's custom extraction rules.")
-    except Exception as e:
-        st.warning("⚠️ LLM generated invalid rules. Falling back to default robust patterns.")
-        date_pattern = re.compile(r"^(\d{1,4}[-/.\s][a-zA-Z0-9]{2,3}[-/.\s]\d{2,4})")
-        amount_pattern = re.compile(r"([\d,]+\.\d{2})\s*(?:Cr|Dr|CR|DR)?\s*", re.IGNORECASE)
+    except Exception:
+        # If the LLM wrote invalid regex syntax, we fail gracefully
+        return pd.DataFrame()
 
     for text in pages_text:
         for line in text.split("\n"):
             line = line.strip()
             date_match = date_pattern.search(line)
             
-            # If the line contains a date, assume it's a transaction
             if date_match:
-                # Some regex patterns match mid-string, we want the start of the line or close to it
-                if date_match.start() > 10: 
+                if date_match.start() > 15: 
                     continue 
 
                 date_str = date_match.group(1) if date_match.groups() else date_match.group(0)
-                
-                # Remove the date from the line to parse the rest
                 rest_of_line = line[date_match.end():].strip()
-                
-                # Extract all amounts
                 amounts = amount_pattern.findall(rest_of_line)
-                
-                # The description is whatever is left after removing amounts
                 description = amount_pattern.sub("", rest_of_line).strip()
                 
-                # Assign columns logically based on how many amounts were found
                 withdrawal, deposit, balance = None, None, None
                 if len(amounts) >= 3:
                     withdrawal = clean_amount(amounts[-3])
                     deposit = clean_amount(amounts[-2])
                     balance = clean_amount(amounts[-1])
                 elif len(amounts) == 2:
-                    withdrawal = clean_amount(amounts[-2]) # Guessing it's a withdrawal
+                    withdrawal = clean_amount(amounts[-2])
                     balance = clean_amount(amounts[-1])
                 elif len(amounts) == 1:
                     balance = clean_amount(amounts[-1])
@@ -161,39 +154,22 @@ def execute_extraction(pages_text, strategy):
     return pd.DataFrame(transactions)
 
 # ==============================
-# STEP 3: VALIDATE WITH LLM
+# STEP 3: VALIDATE
 # ==============================
 def validate_with_llm(first_page_text, df_sample):
-    """Ask LLM to check if the executed data matches the raw text."""
     sample_json = df_sample.to_json(orient="records")
-    
     prompt = f"""
-    You are a QA Agent. I extracted this data using regex. 
-    Does the extracted data accurately reflect the raw text from the first page?
-    
-    RAW TEXT:
-    {first_page_text[:3000]}
-    
-    EXTRACTED DATA:
-    {sample_json}
-    
-    Return ONLY a JSON object:
-    {{
-      "is_correct": true or false,
-      "reason": "1 sentence explaining why."
-    }}
+    You are a QA Agent. Does the extracted data accurately reflect the raw text from the first page?
+    RAW TEXT: {first_page_text[:3000]}
+    EXTRACTED DATA: {sample_json}
+    Return ONLY a JSON object: {{"is_correct": true/false, "reason": "why"}}
     """
-    
     response = call_llm(prompt)
     data = safe_json_loads(response)
-    
     if data and "is_correct" in data:
         return data["is_correct"], data.get("reason", "No reason provided.")
     return False, "Failed to parse LLM validation."
 
-# ==============================
-# EXPORT
-# ==============================
 def to_excel(df):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -204,8 +180,7 @@ def to_excel(df):
 # ==============================
 # UI
 # ==============================
-st.title("🤖 Agentic PDF Parser")
-st.markdown("**Workflow:** Consult LLM ➡️ Execute Python ➡️ Validate with LLM")
+st.title("🤖 Agentic PDF Parser (With Self-Correction)")
 
 file = st.file_uploader("Upload Bank Statement (PDF)", type=["pdf"])
 
@@ -214,40 +189,52 @@ if file:
     password = st.text_input("Password (if any)", type="password")
 
     if st.button("Start Agentic Extraction"):
-        
-        # Get text
         pages_text = extract_pages_text(pdf_bytes, password)
         if not pages_text:
             st.error("❌ No text found. Might be a scanned image.")
             st.stop()
             
         first_page_raw = pages_text[0]
-
-        # STEP 1: Consult
-        with st.spinner("Step 1: Consulting LLM for extraction rules..."):
-            strategy = consult_llm_for_strategy(first_page_raw)
+        
+        # --- THE SELF-CORRECTION LOOP ---
+        max_retries = 5
+        feedback = ""
+        df = pd.DataFrame()
+        
+        st.write("### 🔄 Extraction Loop")
+        status_box = st.empty()
+        
+        for attempt in range(max_retries):
+            status_box.info(f"Attempt {attempt + 1}/{max_retries}: Consulting LLM...")
+            
+            # Consult with feedback (feedback is empty on attempt 1)
+            strategy = consult_llm_for_strategy(first_page_raw, feedback)
             
             if not strategy:
-                st.warning("⚠️ LLM failed to provide a strategy. Using default rules.")
-                strategy = {
-                    "date_regex": r"^(\d{1,4}[-/.\s][a-zA-Z0-9]{2,3}[-/.\s]\d{2,4})",
-                    "amount_regex": r"([\d,]+\.\d{2})\s*(?:Cr|Dr|CR|DR)?\s*"
-                }
-            else:
-                st.success(f"✅ LLM Strategy acquired! (Confidence: {strategy.get('confidence', 'N/A')}/10)")
-
-        # STEP 2: Execute
-        with st.spinner("Step 2: Executing bulk data extraction..."):
+                feedback = "You failed to return a valid JSON object. Try again and return ONLY JSON."
+                continue
+                
+            status_box.info(f"Attempt {attempt + 1}: Testing Regex -> Date: `{strategy.get('date_regex')}`")
+            
+            # Execute
             df = execute_extraction(pages_text, strategy)
             
-            if df.empty:
-                st.error("❌ Extraction yielded 0 rows. The layout may be too complex.")
-                st.stop()
-                
-            st.success(f"✅ Extracted {len(df)} transactions.")
+            if not df.empty:
+                status_box.success(f"✅ Success on Attempt {attempt + 1}! Extracted {len(df)} rows.")
+                break # Break out of the loop! We got data!
+            else:
+                # Tell the LLM why it failed for the next loop
+                feedback = f"The regex patterns you provided: date_regex '{strategy.get('date_regex')}' and amount_regex '{strategy.get('amount_regex')}' resulted in 0 rows extracted. The regex did not match the actual text. Please write a completely different regex pattern."
+                st.warning(f"Attempt {attempt + 1} yielded 0 rows. Requesting new strategy...")
+
+        # --------------------------------
+        
+        if df.empty:
+            st.error("❌ LLM failed to write a working regex after 5 attempts. The layout might be too complex for simple Regex extraction.")
+            st.stop()
 
         # STEP 3: Validate
-        with st.spinner("Step 3: Validating results with LLM..."):
+        with st.spinner("Validating results with LLM..."):
             is_valid, reason = validate_with_llm(first_page_raw, df.head(5))
             
             if is_valid:
