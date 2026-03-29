@@ -9,7 +9,7 @@ import requests
 # ==============================
 # CONFIG
 # ==============================
-st.set_page_config(page_title="PDF → Excel (LLM Ready)", layout="centered")
+st.set_page_config(page_title="PDF → Excel (Robust)", layout="centered")
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 
@@ -18,7 +18,6 @@ GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 # ==============================
 def is_date(val):
     return bool(val and re.match(r"\d{2}-\d{2}-\d{4}", str(val).strip()))
-
 
 def clean_amount(val):
     if not val:
@@ -30,14 +29,27 @@ def clean_amount(val):
     except:
         return None
 
+# ==============================
+# PASSWORD HANDLING
+# ==============================
+def open_pdf_with_password(pdf_bytes, password=None):
+    try:
+        pdf = pdfplumber.open(io.BytesIO(pdf_bytes), password=password)
+        return pdf
+    except:
+        return None
 
 # ==============================
-# TABLE EXTRACTION (FAST & BEST)
+# TABLE EXTRACTION
 # ==============================
-def extract_via_table(pdf_bytes):
+def extract_via_table(pdf_bytes, password=None):
     rows = []
 
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    pdf = open_pdf_with_password(pdf_bytes, password)
+    if pdf is None:
+        raise ValueError("Incorrect or missing password")
+
+    with pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
             for table in tables:
@@ -58,9 +70,8 @@ def extract_via_table(pdf_bytes):
 
     return pd.DataFrame(rows)
 
-
 # ==============================
-# LLM EXTRACTION (STRUCTURED)
+# LLM EXTRACTION
 # ==============================
 def extract_structured_via_llm(text):
     prompt = f"""
@@ -100,23 +111,27 @@ TEXT:
 
     content = response.json()["choices"][0]["message"]["content"]
 
-    # Extract JSON safely
+    # Safe JSON extraction
     start = content.find("[")
     end = content.rfind("]") + 1
     data = json.loads(content[start:end])
 
     return pd.DataFrame(data)
 
-
-def extract_sample_text(pdf_bytes, pages=2):
+def extract_sample_text(pdf_bytes, password=None, pages=2):
     texts = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+    pdf = open_pdf_with_password(pdf_bytes, password)
+
+    if pdf is None:
+        return ""
+
+    with pdf:
         for i in range(min(pages, len(pdf.pages))):
             t = pdf.pages[i].extract_text()
             if t:
                 texts.append(t)
-    return "\n".join(texts)
 
+    return "\n".join(texts)
 
 # ==============================
 # VALIDATION
@@ -127,25 +142,19 @@ def validate_first_page(df):
     if df.empty:
         return ["No data extracted"]
 
-    # Date check
     bad_dates = df[~df["Date"].astype(str).str.match(r"\d{2}-\d{2}-\d{4}", na=False)]
     if not bad_dates.empty:
         issues.append(f"{len(bad_dates)} invalid dates")
 
-    # Debit & Credit both
-    both = df[
-        df["Withdrawals"].notna() & df["Deposits"].notna()
-    ]
+    both = df[df["Withdrawals"].notna() & df["Deposits"].notna()]
     if not both.empty:
         issues.append(f"{len(both)} rows with both debit & credit")
 
-    # Missing balance
     if "Balance" in df.columns:
         if df["Balance"].isna().mean() > 0.5:
             issues.append("Too many missing balances")
 
     return issues
-
 
 # ==============================
 # TO EXCEL
@@ -157,17 +166,19 @@ def df_to_excel(df):
     buf.seek(0)
     return buf
 
-
 # ==============================
 # UI
 # ==============================
-st.title("🏦 Bank PDF → Excel (LLM Powered)")
+st.title("🏦 Bank PDF → Excel (Robust + LLM)")
 
 pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
 
 if pdf_file:
 
     pdf_bytes = pdf_file.read()
+
+    # 🔐 Password Input
+    password = st.text_input("🔐 Enter PDF Password (if protected)", type="password")
 
     if st.button("🚀 Convert"):
 
@@ -176,23 +187,34 @@ if pdf_file:
         # --------------------------
         # STEP 1: TABLE EXTRACTION
         # --------------------------
-        with st.spinner("🔍 Trying table extraction..."):
-            df = extract_via_table(pdf_bytes)
+        try:
+            with st.spinner("🔍 Trying table extraction..."):
+                df = extract_via_table(
+                    pdf_bytes,
+                    password=password if password else None
+                )
 
-        if not df.empty:
-            st.success(f"✅ Table extraction worked ({len(df)} rows)")
-        else:
-            st.warning("⚠️ Table extraction failed → switching to LLM")
+            if not df.empty:
+                st.success(f"✅ Table extraction worked ({len(df)} rows)")
+            else:
+                st.warning("⚠️ No data found via tables")
+
+        except Exception:
+            st.warning("⚠️ PDF locked or table extraction failed")
 
         # --------------------------
-        # STEP 2: VALIDATE
+        # STEP 2: VALIDATION
         # --------------------------
         if not df.empty:
             issues = validate_first_page(df.head(20))
 
             if issues:
-                st.warning("⚠️ Validation failed → using LLM fallback")
-                df = pd.DataFrame()  # force fallback
+                st.warning("⚠️ Validation issues found:")
+                for i in issues:
+                    st.write(f"- {i}")
+
+                st.info("🔁 Switching to LLM fallback...")
+                df = pd.DataFrame()
             else:
                 st.success("✅ First page validated!")
 
@@ -200,12 +222,21 @@ if pdf_file:
         # STEP 3: LLM FALLBACK
         # --------------------------
         if df.empty:
+
             if not GROQ_API_KEY:
                 st.error("❌ No Groq API key found")
                 st.stop()
 
             with st.spinner("🤖 Extracting using LLM..."):
-                sample_text = extract_sample_text(pdf_bytes)
+                sample_text = extract_sample_text(
+                    pdf_bytes,
+                    password=password if password else None
+                )
+
+                if not sample_text:
+                    st.error("❌ Could not read PDF (check password)")
+                    st.stop()
+
                 df = extract_structured_via_llm(sample_text)
 
         # --------------------------
@@ -221,13 +252,14 @@ if pdf_file:
 
             # Summary
             st.subheader("Summary")
-            st.write(f"Transactions: {len(df)}")
 
             total_dr = pd.to_numeric(df["Withdrawals"], errors="coerce").sum()
             total_cr = pd.to_numeric(df["Deposits"], errors="coerce").sum()
 
-            st.write(f"Total Withdrawals: ₹{total_dr:,.2f}")
-            st.write(f"Total Deposits: ₹{total_cr:,.2f}")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Transactions", len(df))
+            col2.metric("Withdrawals", f"₹{total_dr:,.2f}")
+            col3.metric("Deposits", f"₹{total_cr:,.2f}")
 
             # Download
             excel_file = df_to_excel(df)
@@ -241,3 +273,6 @@ if pdf_file:
 
 else:
     st.info("Upload a PDF to start.")
+
+st.divider()
+st.caption("💡 Supports password-protected PDFs + LLM fallback for any format")
