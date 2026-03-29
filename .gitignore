@@ -1,0 +1,2 @@
+# NEVER commit secrets to GitHub
+.streamlit/secrets.toml
